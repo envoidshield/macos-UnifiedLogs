@@ -14,7 +14,7 @@ use macos_unifiedlogs::timesync::TimesyncBoot;
 use macos_unifiedlogs::traits::FileProvider;
 use macos_unifiedlogs::unified_log::{LogData, UnifiedLogData};
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::Display;
 use std::fs;
@@ -72,6 +72,11 @@ struct Args {
     /// Maximum number of files to process (for benchmarking)
     #[clap(long)]
     max_files: Option<usize>,
+
+    /// Comma-separated list of fields to exclude from output.
+    /// Available fields: raw_message, message_entries, library_uuid, process_uuid, boot_uuid
+    #[clap(long, value_delimiter = ',')]
+    exclude_fields: Option<Vec<String>>,
 }
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
@@ -130,7 +135,13 @@ fn main() {
         Box::new(std::io::stdout())
     };
 
-    let mut writer = OutputWriter::new(Box::new(handle), output_format.into()).unwrap();
+    let exclude_fields: HashSet<String> = args
+        .exclude_fields
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let mut writer = OutputWriter::new(Box::new(handle), output_format.into(), exclude_fields).unwrap();
 
     match (args.mode, args.input) {
         (Mode::Live, None) => {
@@ -345,6 +356,7 @@ fn iterate_chunks(
 
 pub struct OutputWriter {
     writer: OutputWriterEnum,
+    exclude_fields: HashSet<String>,
 }
 
 enum OutputWriterEnum {
@@ -353,7 +365,11 @@ enum OutputWriterEnum {
 }
 
 impl OutputWriter {
-    pub fn new(writer: Box<dyn Write>, output_format: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        writer: Box<dyn Write>,
+        output_format: &str,
+        exclude_fields: HashSet<String>,
+    ) -> Result<Self, Box<dyn Error>> {
         let writer_enum = match output_format {
             "csv" => {
                 let mut csv_writer = Writer::from_writer(writer);
@@ -389,6 +405,7 @@ impl OutputWriter {
 
         Ok(OutputWriter {
             writer: writer_enum,
+            exclude_fields,
         })
     }
 
@@ -405,19 +422,46 @@ impl OutputWriter {
                     record.pid.to_string(),
                     record.euid.to_string(),
                     record.library.to_owned(),
-                    record.library_uuid.to_owned(),
+                    if self.exclude_fields.contains("library_uuid") {
+                        String::new()
+                    } else {
+                        record.library_uuid.to_owned()
+                    },
                     record.activity_id.to_string(),
                     record.category.to_owned(),
                     record.process.to_owned(),
-                    record.process_uuid.to_owned(),
+                    if self.exclude_fields.contains("process_uuid") {
+                        String::new()
+                    } else {
+                        record.process_uuid.to_owned()
+                    },
                     record.message.to_owned(),
-                    record.raw_message.to_owned(),
-                    record.boot_uuid.to_owned(),
+                    if self.exclude_fields.contains("raw_message") {
+                        String::new()
+                    } else {
+                        record.raw_message.to_owned()
+                    },
+                    if self.exclude_fields.contains("boot_uuid") {
+                        String::new()
+                    } else {
+                        record.boot_uuid.to_owned()
+                    },
                     record.timezone_name.to_owned(),
                 ])?;
             }
             OutputWriterEnum::Json(json_writer) => {
-                writeln!(json_writer, "{}", serde_json::to_string(record).unwrap())?;
+                if self.exclude_fields.is_empty() {
+                    writeln!(json_writer, "{}", serde_json::to_string(record).unwrap())?;
+                } else {
+                    // Convert to JSON Value and remove excluded fields
+                    let mut json_value = serde_json::to_value(record).unwrap();
+                    if let serde_json::Value::Object(ref mut map) = json_value {
+                        for field in &self.exclude_fields {
+                            map.remove(field);
+                        }
+                    }
+                    writeln!(json_writer, "{}", serde_json::to_string(&json_value).unwrap())?;
+                }
             }
         }
         Ok(())
