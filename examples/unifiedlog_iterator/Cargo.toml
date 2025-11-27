@@ -13,3 +13,4 @@ log = "0.4.28"
 serde_json = "1.0.145"
 macos-unifiedlogs = { path = "../../" }
 clap = { version = "4.5.48", features = ["derive"] }
+rayon = "1.10"

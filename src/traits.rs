@@ -26,8 +26,14 @@ pub trait FileProvider {
     /// This avoids having to read all `UUIDText` files into memory.
     fn read_uuidtext(&self, uuid: &str) -> Result<UUIDText, Error>;
 
-    /// Check our cached `UUIDText` data for strings
+    /// Check our cached `UUIDText` data for strings (returns reference)
     fn cached_uuidtext(&self, uuid: &str) -> Option<&UUIDText>;
+
+    /// Check our cached `UUIDText` data for strings (returns owned clone)
+    /// Used by thread-safe providers. Default implementation clones from cached_uuidtext.
+    fn cached_uuidtext_owned(&self, uuid: &str) -> Option<UUIDText> {
+        self.cached_uuidtext(uuid).cloned()
+    }
 
     /// Update our cached `UUIDText` data
     fn update_uuid(&mut self, uuid: &str, uuid2: &str);
@@ -43,8 +49,14 @@ pub trait FileProvider {
     /// This avoids having to read all `SharedCacheStrings` files into memory.
     fn read_dsc_uuid(&self, uuid: &str) -> Result<SharedCacheStrings, Error>;
 
-    /// Check our cached `SharedCacheStrings` for strings
+    /// Check our cached `SharedCacheStrings` for strings (returns reference)
     fn cached_dsc(&self, uuid: &str) -> Option<&SharedCacheStrings>;
+
+    /// Check our cached `SharedCacheStrings` for strings (returns owned clone)
+    /// Used by thread-safe providers. Default implementation clones from cached_dsc.
+    fn cached_dsc_owned(&self, uuid: &str) -> Option<SharedCacheStrings> {
+        self.cached_dsc(uuid).cloned()
+    }
 
     /// Update our cached `SharedCacheStrings` data
     fn update_dsc(&mut self, uuid: &str, uuid2: &str);

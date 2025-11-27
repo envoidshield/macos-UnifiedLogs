@@ -13,6 +13,7 @@ use macos_unifiedlogs::parser::{build_log, collect_timesync, parse_log};
 use macos_unifiedlogs::timesync::TimesyncBoot;
 use macos_unifiedlogs::traits::FileProvider;
 use macos_unifiedlogs::unified_log::{LogData, UnifiedLogData};
+use rayon::prelude::*;
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -77,6 +78,14 @@ struct Args {
     /// Available fields: raw_message, message_entries, library_uuid, process_uuid, boot_uuid
     #[clap(long, value_delimiter = ',')]
     exclude_fields: Option<Vec<String>>,
+
+    /// Enable parallel processing of tracev3 files
+    #[clap(long, short = 'j')]
+    parallel: bool,
+
+    /// Number of threads for parallel processing (default: all cores)
+    #[clap(long, short = 't')]
+    threads: Option<usize>,
 }
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
@@ -123,6 +132,14 @@ fn main() {
     let args = Args::parse();
     let output_format = args.format;
 
+    // Configure thread pool if --threads is specified
+    if let Some(num_threads) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build_global()
+            .expect("Failed to configure thread pool");
+    }
+
     let handle: Box<dyn Write> = if let Some(path) = args.output {
         Box::new(
             fs::OpenOptions::new()
@@ -145,10 +162,10 @@ fn main() {
 
     match (args.mode, args.input) {
         (Mode::Live, None) => {
-            parse_live_system(&mut writer, args.max_files);
+            parse_live_system(&mut writer, args.max_files, args.parallel);
         }
         (Mode::LogArchive, Some(path)) => {
-            parse_log_archive(&path, &mut writer, args.max_files);
+            parse_log_archive(&path, &mut writer, args.max_files, args.parallel);
         }
         (Mode::SingleFile, Some(path)) => {
             parse_single_file(&path, &mut writer);
@@ -190,24 +207,32 @@ fn parse_single_file(path: &Path, writer: &mut OutputWriter) {
 }
 
 // Parse a provided directory path. Currently, expect the path to follow macOS log collect structure
-fn parse_log_archive(path: &Path, writer: &mut OutputWriter, max_files: Option<usize>) {
-    let mut provider = LogarchiveProvider::new(path);
+fn parse_log_archive(path: &Path, writer: &mut OutputWriter, max_files: Option<usize>, parallel: bool) {
+    let provider = LogarchiveProvider::new(path);
 
     // Parse all timesync files
     let timesync_data = collect_timesync(&provider).unwrap();
 
     // Keep UUID, UUID cache, timesync files in memory while we parse all tracev3 files
     // Allows for faster lookups
-    parse_trace_file(&timesync_data, &mut provider, writer, max_files);
+    if parallel {
+        parse_trace_file_parallel(path, &timesync_data, writer, max_files);
+    } else {
+        let mut provider = LogarchiveProvider::new(path);
+        parse_trace_file(&timesync_data, &mut provider, writer, max_files);
+    }
 
     info!("Finished parsing Unified Log data.");
 }
 
 // Parse a live macOS system
-fn parse_live_system(writer: &mut OutputWriter, max_files: Option<usize>) {
+fn parse_live_system(writer: &mut OutputWriter, max_files: Option<usize>, parallel: bool) {
     let mut provider = LiveSystemProvider::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
+    if parallel {
+        eprintln!("[WARNING] Parallel mode not supported for live system, falling back to sequential");
+    }
     parse_trace_file(&timesync_data, &mut provider, writer, max_files);
 
     info!("Finished parsing Unified Log data.");
@@ -306,6 +331,168 @@ fn parse_trace_file(
         }
     }
     info!("Parsed {log_count} log entries");
+}
+
+// Parallel version of parse_trace_file
+fn parse_trace_file_parallel(
+    archive_path: &Path,
+    timesync_data: &HashMap<String, TimesyncBoot>,
+    writer: &mut OutputWriter,
+    max_files: Option<usize>,
+) {
+    let total_start = Instant::now();
+    
+    // Phase 1: Pre-load DSC files (shared cache strings)
+    // These are large (30-150MB each) but few (~5-6 files)
+    eprintln!("[PARALLEL] Pre-loading DSC files...");
+    let preload_start = Instant::now();
+    let mut base_provider = LogarchiveProvider::new(archive_path);
+    base_provider.preload_dsc();
+    let (_, dsc_count) = base_provider.cache_stats();
+    eprintln!("[PARALLEL] Pre-loaded {} DSC files in {:.2}s", dsc_count, preload_start.elapsed().as_secs_f64());
+    
+    // Phase 2: Collect all file paths
+    let file_paths: Vec<String> = base_provider
+        .tracev3_files()
+        .filter(|source| {
+            !Path::new(source.source_path())
+                .file_name()
+                .is_some_and(|f| f.to_str().unwrap().starts_with("._"))
+        })
+        .map(|source| source.source_path().to_string())
+        .take(max_files.unwrap_or(usize::MAX))
+        .collect();
+    
+    let file_count = file_paths.len();
+    eprintln!("[PARALLEL] Processing {} files with {} threads", file_count, rayon::current_num_threads());
+    
+    // Phase 3: Process files in parallel
+    // Each thread gets a clone of the provider with pre-loaded DSC cache
+    let results: Vec<_> = file_paths
+        .par_iter()
+        .enumerate()
+        .map(|(idx, file_path)| {
+            let file_start = Instant::now();
+            
+            // Clone provider with pre-loaded DSC cache
+            let mut thread_provider = base_provider.clone();
+            
+            // Read file
+            let mut buf = Vec::new();
+            match fs::File::open(file_path) {
+                Ok(mut file) => {
+                    if let Err(err) = file.read_to_end(&mut buf) {
+                        log::error!("Failed to read {}: {}", file_path, err);
+                        let empty_oversize = UnifiedLogData {
+                            header: Vec::new(),
+                            catalog_data: Vec::new(),
+                            oversize: Vec::new(),
+                        };
+                        return (Vec::new(), empty_oversize, Vec::new(), 0usize);
+                    }
+                }
+                Err(err) => {
+                    log::error!("Failed to open {}: {}", file_path, err);
+                    let empty_oversize = UnifiedLogData {
+                        header: Vec::new(),
+                        catalog_data: Vec::new(),
+                        oversize: Vec::new(),
+                    };
+                    return (Vec::new(), empty_oversize, Vec::new(), 0usize);
+                }
+            }
+            
+            let log_iterator = UnifiedLogIterator {
+                data: buf,
+                header: Vec::new(),
+            };
+            
+            let mut local_results: Vec<LogData> = Vec::new();
+            let mut local_oversize = UnifiedLogData {
+                header: Vec::new(),
+                catalog_data: Vec::new(),
+                oversize: Vec::new(),
+            };
+            let mut local_missing: Vec<UnifiedLogData> = Vec::new();
+            let exclude_missing = true;
+            
+            for mut chunk in log_iterator {
+                chunk.oversize.append(&mut local_oversize.oversize);
+                let (results, missing_logs) = build_log(&chunk, &mut thread_provider, timesync_data, exclude_missing);
+                local_results.extend(results);
+                local_oversize.oversize = chunk.oversize;
+                
+                if !missing_logs.catalog_data.is_empty()
+                    || !missing_logs.header.is_empty()
+                    || !missing_logs.oversize.is_empty()
+                {
+                    local_missing.push(missing_logs);
+                }
+            }
+            
+            let file_duration = file_start.elapsed();
+            let count = local_results.len();
+            eprintln!(
+                "[{}/{}] {} - {} entries ({:.0}/sec) in {:.2}s",
+                idx + 1,
+                file_count,
+                Path::new(file_path).file_name().unwrap().to_str().unwrap(),
+                count,
+                count as f64 / file_duration.as_secs_f64(),
+                file_duration.as_secs_f64()
+            );
+            
+            (local_results, local_oversize, local_missing, count)
+        })
+        .collect();
+    
+    // Phase 4: Merge and output results
+    let mut total_log_count = 0usize;
+    let mut all_oversize = UnifiedLogData {
+        header: Vec::new(),
+        catalog_data: Vec::new(),
+        oversize: Vec::new(),
+    };
+    let mut all_missing: Vec<UnifiedLogData> = Vec::new();
+    
+    for (logs, mut oversize_data, missing, count) in results {
+        total_log_count += count;
+        all_oversize.oversize.append(&mut oversize_data.oversize);
+        all_missing.extend(missing);
+        
+        // Output logs
+        if let Err(err) = output(&logs, writer) {
+            log::error!("Failed to output log data: {err:?}");
+        }
+    }
+    
+    let total_duration = total_start.elapsed();
+    eprintln!("\n[BENCHMARK] Total parsing time: {:.2}s", total_duration.as_secs_f64());
+    eprintln!("[BENCHMARK] Files processed: {}", file_count);
+    eprintln!("[BENCHMARK] Total log entries: {}", total_log_count);
+    eprintln!("[BENCHMARK] Average: {:.0} entries/sec", total_log_count as f64 / total_duration.as_secs_f64());
+    
+    // Phase 5: Process missing data with merged oversize cache
+    debug!("Oversize cache size: {}", all_oversize.oversize.len());
+    debug!("Logs with missing Oversize strings: {}", all_missing.len());
+    
+    if !all_missing.is_empty() {
+        eprintln!("[PARALLEL] Processing {} missing data entries...", all_missing.len());
+        let mut provider = LogarchiveProvider::new(archive_path);
+        let include_missing = false;
+        
+        for mut leftover_data in all_missing {
+            leftover_data.oversize = all_oversize.oversize.clone();
+            let (results, _) = build_log(&leftover_data, &mut provider, timesync_data, include_missing);
+            total_log_count += results.len();
+            
+            if let Err(err) = output(&results, writer) {
+                log::error!("Failed to output remaining log data: {err:?}");
+            }
+        }
+    }
+    
+    info!("Parsed {total_log_count} log entries");
 }
 
 fn iterate_chunks(
