@@ -1,2 +1,10 @@
 [workspace]
 members = ["unifiedlog_iterator"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3          # Maximum optimization
+lto = "thin"           # Link-Time Optimization
+codegen-units = 1      # Better optimization
+panic = "abort"        # Smaller binary, slightly faster
+strip = true           # Strip symbols

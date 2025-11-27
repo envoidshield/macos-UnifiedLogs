@@ -52,10 +52,9 @@ impl MessageData {
         }
 
         // Check if the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0
-            && let Some(shared_string) = provider.cached_dsc(&dsc_uuid)
-            && let Some(ranges) = shared_string.ranges.first()
-        {
+        if original_offset & 0x80000000 != 0 {
+            if let Some(shared_string) = provider.cached_dsc(&dsc_uuid) {
+                if let Some(ranges) = shared_string.ranges.first() {
             shared_string.uuids[ranges.unknown_uuid_index as usize]
                 .path_string
                 .clone_into(&mut message_data.library);
@@ -72,6 +71,8 @@ impl MessageData {
             message_data.process = process_string;
 
             return Ok((&[], message_data));
+                }
+            }
         }
 
         // Get shared strings collections
@@ -194,20 +195,20 @@ impl MessageData {
         }
 
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0
-            && let Some(data) = provider.cached_uuidtext(&message_data.process_uuid)
-        {
-            // Footer data is a collection of strings that ends with the image path/library associated with strings
-            let strings = &data.footer_data;
-            let footer_data: &[u8] = strings;
+        if original_offset & 0x80000000 != 0 {
+            if let Some(data) = provider.cached_uuidtext(&message_data.process_uuid) {
+                // Footer data is a collection of strings that ends with the image path/library associated with strings
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
 
-            let (_, process_string) =
-                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-            process_string.clone_into(&mut message_data.process);
-            message_data.library = process_string;
-            message_data.format_string = String::from("%s");
+                let (_, process_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+                process_string.clone_into(&mut message_data.process);
+                message_data.library = process_string;
+                message_data.format_string = String::from("%s");
 
-            return Ok((&[], message_data));
+                return Ok((&[], message_data));
+            }
         }
 
         // Get the collection of parsed UUIDText files until matching UUID file is found
@@ -341,25 +342,25 @@ impl MessageData {
             provider.update_uuid(&message_data.library_uuid, &message_data.process_uuid);
         }
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if ((original_offset & 0x80000000 != 0) || string_offset == absolute_offset)
-            && let Some(data) = provider.cached_uuidtext(&message_data.library_uuid)
-        {
-            // Footer data is a collection of strings that ends with the image path/library associated with strings
-            let strings = &data.footer_data;
-            let footer_data: &[u8] = strings;
+        if (original_offset & 0x80000000 != 0) || string_offset == absolute_offset {
+            if let Some(data) = provider.cached_uuidtext(&message_data.library_uuid) {
+                // Footer data is a collection of strings that ends with the image path/library associated with strings
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
 
-            // Extract image path from current UUIDtext file
-            let (_, library_string) =
-                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-            message_data.library = library_string;
+                // Extract image path from current UUIDtext file
+                let (_, library_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+                message_data.library = library_string;
 
-            // Extract image path from second UUIDtext file
-            let (_, process_string) =
-                MessageData::get_uuid_image_path(&message_data.process_uuid, provider)?;
-            message_data.process = process_string;
-            message_data.format_string = String::from("%s");
+                // Extract image path from second UUIDtext file
+                let (_, process_string) =
+                    MessageData::get_uuid_image_path(&message_data.process_uuid, provider)?;
+                message_data.process = process_string;
+                message_data.format_string = String::from("%s");
 
-            return Ok((&[], message_data));
+                return Ok((&[], message_data));
+            }
         }
 
         if let Some(data) = provider.cached_uuidtext(&message_data.library_uuid) {
@@ -494,25 +495,25 @@ impl MessageData {
             provider.update_uuid(&message_data.process_uuid, &message_data.library_uuid);
         }
         // If most significant bit is set, the string offset is "dynamic" (the formatter is "%s")
-        if original_offset & 0x80000000 != 0
-            && let Some(data) = provider.cached_uuidtext(uuid)
-        {
-            // Footer data is a collection of strings that ends with the image path/library associated with strings
-            let strings = &data.footer_data;
-            let footer_data: &[u8] = strings;
+        if original_offset & 0x80000000 != 0 {
+            if let Some(data) = provider.cached_uuidtext(uuid) {
+                // Footer data is a collection of strings that ends with the image path/library associated with strings
+                let strings = &data.footer_data;
+                let footer_data: &[u8] = strings;
 
-            // Extract image path from current UUIDtext file
-            let (_, library_string) =
-                MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
-            message_data.library = library_string;
+                // Extract image path from current UUIDtext file
+                let (_, library_string) =
+                    MessageData::uuidtext_image_path(footer_data, &data.entry_descriptors)?;
+                message_data.library = library_string;
 
-            // Extract image path from second UUIDtext file
-            let (_, process_string) =
-                MessageData::get_uuid_image_path(&message_data.process_uuid, provider)?;
-            message_data.process = process_string;
-            message_data.format_string = String::from("%s");
+                // Extract image path from second UUIDtext file
+                let (_, process_string) =
+                    MessageData::get_uuid_image_path(&message_data.process_uuid, provider)?;
+                message_data.process = process_string;
+                message_data.format_string = String::from("%s");
 
-            return Ok((&[], message_data));
+                return Ok((&[], message_data));
+            }
         }
 
         if let Some(data) = provider.cached_uuidtext(uuid) {

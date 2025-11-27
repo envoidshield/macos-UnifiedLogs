@@ -20,6 +20,7 @@ use std::fmt::Display;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use clap::{Parser, ValueEnum, builder};
 use csv::Writer;
@@ -67,6 +68,10 @@ struct Args {
     /// If false, will overwrite output file
     #[clap(short, long, default_value = "false")]
     append: bool,
+
+    /// Maximum number of files to process (for benchmarking)
+    #[clap(long)]
+    max_files: Option<usize>,
 }
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
@@ -129,10 +134,10 @@ fn main() {
 
     match (args.mode, args.input) {
         (Mode::Live, None) => {
-            parse_live_system(&mut writer);
+            parse_live_system(&mut writer, args.max_files);
         }
         (Mode::LogArchive, Some(path)) => {
-            parse_log_archive(&path, &mut writer);
+            parse_log_archive(&path, &mut writer, args.max_files);
         }
         (Mode::SingleFile, Some(path)) => {
             parse_single_file(&path, &mut writer);
@@ -174,7 +179,7 @@ fn parse_single_file(path: &Path, writer: &mut OutputWriter) {
 }
 
 // Parse a provided directory path. Currently, expect the path to follow macOS log collect structure
-fn parse_log_archive(path: &Path, writer: &mut OutputWriter) {
+fn parse_log_archive(path: &Path, writer: &mut OutputWriter, max_files: Option<usize>) {
     let mut provider = LogarchiveProvider::new(path);
 
     // Parse all timesync files
@@ -182,17 +187,17 @@ fn parse_log_archive(path: &Path, writer: &mut OutputWriter) {
 
     // Keep UUID, UUID cache, timesync files in memory while we parse all tracev3 files
     // Allows for faster lookups
-    parse_trace_file(&timesync_data, &mut provider, writer);
+    parse_trace_file(&timesync_data, &mut provider, writer, max_files);
 
     info!("Finished parsing Unified Log data.");
 }
 
 // Parse a live macOS system
-fn parse_live_system(writer: &mut OutputWriter) {
+fn parse_live_system(writer: &mut OutputWriter, max_files: Option<usize>) {
     let mut provider = LiveSystemProvider::default();
     let timesync_data = collect_timesync(&provider).unwrap();
 
-    parse_trace_file(&timesync_data, &mut provider, writer);
+    parse_trace_file(&timesync_data, &mut provider, writer, max_files);
 
     info!("Finished parsing Unified Log data.");
 }
@@ -202,6 +207,7 @@ fn parse_trace_file(
     timesync_data: &HashMap<String, TimesyncBoot>,
     provider: &mut dyn FileProvider,
     writer: &mut OutputWriter,
+    max_files: Option<usize>,
 ) {
     // We need to persist the Oversize log entries (they contain large strings that don't fit in normal log entries)
     // Some log entries have Oversize strings located in different tracev3 files.
@@ -216,6 +222,9 @@ fn parse_trace_file(
 
     // Loop through all tracev3 files in Persist directory
     let mut log_count = 0;
+    let mut file_count = 0;
+    let total_start = Instant::now();
+    
     for mut source in provider.tracev3_files() {
         if Path::new(source.source_path())
             .file_name()
@@ -223,8 +232,21 @@ fn parse_trace_file(
         {
             continue;
         }
-        println!("Parsing: {}", source.source_path());
-        log_count += iterate_chunks(
+        
+        if let Some(max) = max_files {
+            if file_count >= max {
+                eprintln!("\n[BENCHMARK] Stopping after {} files (max_files limit)", file_count);
+                break;
+            }
+        }
+        
+        file_count += 1;
+        let file_start = Instant::now();
+        let file_path = source.source_path().to_string();
+        
+        eprintln!("[{}] Parsing: {}", file_count, file_path);
+        
+        let file_log_count = iterate_chunks(
             source.reader(),
             &mut missing_data,
             provider,
@@ -232,8 +254,26 @@ fn parse_trace_file(
             writer,
             &mut oversize_strings,
         );
+        
+        let file_duration = file_start.elapsed();
+        log_count += file_log_count;
+        
+        eprintln!(
+            "[{}] Completed in {:.2}s - {} log entries ({:.0} entries/sec)",
+            file_count,
+            file_duration.as_secs_f64(),
+            file_log_count,
+            file_log_count as f64 / file_duration.as_secs_f64()
+        );
+        
         debug!("count: {log_count}");
     }
+    
+    let total_duration = total_start.elapsed();
+    eprintln!("\n[BENCHMARK] Total parsing time: {:.2}s", total_duration.as_secs_f64());
+    eprintln!("[BENCHMARK] Files processed: {}", file_count);
+    eprintln!("[BENCHMARK] Total log entries: {}", log_count);
+    eprintln!("[BENCHMARK] Average: {:.0} entries/sec", log_count as f64 / total_duration.as_secs_f64());
     let include_missing = false;
     debug!("Oversize cache size: {}", oversize_strings.oversize.len());
     debug!("Logs with missing Oversize strings: {}", missing_data.len());
