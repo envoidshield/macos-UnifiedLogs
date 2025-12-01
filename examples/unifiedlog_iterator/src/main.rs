@@ -19,12 +19,39 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::Display;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum, builder};
 use csv::Writer;
+use serde::Serialize;
+
+/// Event format output structure for optimized downstream processing
+#[derive(Serialize)]
+struct Event<'a> {
+    datetime: String,
+    timestamp: f64,
+    message: &'a str,
+    timestamp_desc: &'static str,
+    module: &'static str,
+    data: EventData<'a>,
+}
+
+/// Data object within Event format
+#[derive(Serialize)]
+struct EventData<'a> {
+    subsystem: &'a str,
+    thread_id: u64,
+    pid: u64,
+    euid: u32,
+    library: &'a str,
+    time: f64,
+    category: &'a str,
+    event_type: String,
+    log_type: String,
+    process: &'a str,
+}
 
 #[derive(Clone, Debug)]
 enum RuntimeError {
@@ -79,6 +106,11 @@ struct Args {
     #[clap(long, value_delimiter = ',')]
     exclude_fields: Option<Vec<String>>,
 
+    /// Output format for JSON data. 'default' outputs Mandiant's format,
+    /// 'event' outputs the Event format for downstream processing.
+    #[clap(long, default_value = "default")]
+    output_format: OutputFormat,
+
     /// Enable parallel processing of tracev3 files
     #[clap(long, short = 'j')]
     parallel: bool,
@@ -99,6 +131,16 @@ enum Mode {
 enum Format {
     Csv,
     Jsonl,
+}
+
+/// Output format for JSON data
+#[derive(Parser, Debug, Clone, ValueEnum, Default, PartialEq)]
+pub enum OutputFormat {
+    /// Default format (Mandiant's UnifiedLogReader format)
+    #[default]
+    Default,
+    /// Event format optimized for downstream processing
+    Event,
 }
 
 impl From<Format> for builder::OsStr {
@@ -140,16 +182,18 @@ fn main() {
             .expect("Failed to configure thread pool");
     }
 
+    // Use BufWriter for better I/O performance (64KB buffer)
     let handle: Box<dyn Write> = if let Some(path) = args.output {
-        Box::new(
+        Box::new(BufWriter::with_capacity(
+            64 * 1024,
             fs::OpenOptions::new()
                 .append(true)
                 .create(true)
                 .open(path)
                 .unwrap(),
-        )
+        ))
     } else {
-        Box::new(std::io::stdout())
+        Box::new(BufWriter::with_capacity(64 * 1024, std::io::stdout()))
     };
 
     let exclude_fields: HashSet<String> = args
@@ -158,7 +202,8 @@ fn main() {
         .into_iter()
         .collect();
 
-    let mut writer = OutputWriter::new(Box::new(handle), output_format.into(), exclude_fields).unwrap();
+    let json_output_format = args.output_format;
+    let mut writer = OutputWriter::new(handle, output_format.into(), exclude_fields, json_output_format).unwrap();
 
     match (args.mode, args.input) {
         (Mode::Live, None) => {
@@ -544,6 +589,7 @@ fn iterate_chunks(
 pub struct OutputWriter {
     writer: OutputWriterEnum,
     exclude_fields: HashSet<String>,
+    output_format: OutputFormat,
 }
 
 enum OutputWriterEnum {
@@ -554,10 +600,11 @@ enum OutputWriterEnum {
 impl OutputWriter {
     pub fn new(
         writer: Box<dyn Write>,
-        output_format: &str,
+        file_format: &str,
         exclude_fields: HashSet<String>,
+        output_format: OutputFormat,
     ) -> Result<Self, Box<dyn Error>> {
-        let writer_enum = match output_format {
+        let writer_enum = match file_format {
             "csv" => {
                 let mut csv_writer = Writer::from_writer(writer);
                 // Write CSV headers
@@ -585,7 +632,7 @@ impl OutputWriter {
             }
             "jsonl" => OutputWriterEnum::Json(writer),
             _ => {
-                error!("Unsupported output format: {output_format}");
+                error!("Unsupported file format: {file_format}");
                 std::process::exit(1);
             }
         };
@@ -593,6 +640,7 @@ impl OutputWriter {
         Ok(OutputWriter {
             writer: writer_enum,
             exclude_fields,
+            output_format,
         })
     }
 
@@ -637,7 +685,10 @@ impl OutputWriter {
                 ])?;
             }
             OutputWriterEnum::Json(json_writer) => {
-                if self.exclude_fields.is_empty() {
+                if self.output_format == OutputFormat::Event {
+                    // Event format: optimized for downstream processing
+                    write_event_format(json_writer, record, &self.exclude_fields)?;
+                } else if self.exclude_fields.is_empty() {
                     writeln!(json_writer, "{}", serde_json::to_string(record).unwrap())?;
                 } else {
                     // Convert to JSON Value and remove excluded fields
@@ -669,5 +720,46 @@ fn output(results: &Vec<LogData>, writer: &mut OutputWriter) -> Result<(), Box<d
         writer.write_record(data)?;
     }
     writer.flush()?;
+    Ok(())
+}
+
+/// Write record in Event format for optimized downstream processing
+/// Uses struct-based serialization with simd-json for maximum performance
+fn write_event_format(
+    json_writer: &mut Box<dyn Write>,
+    record: &LogData,
+    _exclude_fields: &HashSet<String>,
+) -> Result<(), Box<dyn Error>> {
+    // Convert time from nanoseconds to datetime and timestamp
+    let time_nanos = record.time as i64;
+    let datetime = Utc.timestamp_nanos(time_nanos);
+    let datetime_str = datetime.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
+    let timestamp_float = time_nanos as f64 / 1_000_000_000.0;
+
+    // Build the EventData struct (core fields only for maximum performance)
+    let data = EventData {
+        subsystem: &record.subsystem,
+        thread_id: record.thread_id,
+        pid: record.pid,
+        euid: record.euid,
+        library: &record.library,
+        time: record.time,
+        category: &record.category,
+        event_type: format!("{:?}", record.event_type),
+        log_type: format!("{:?}", record.log_type),
+        process: &record.process,
+    };
+
+    // Build the Event struct
+    let event = Event {
+        datetime: datetime_str,
+        timestamp: timestamp_float,
+        message: &record.message,
+        timestamp_desc: "logarchive",
+        module: "logarchive",
+        data,
+    };
+
+    writeln!(json_writer, "{}", serde_json::to_string(&event)?)?;
     Ok(())
 }
