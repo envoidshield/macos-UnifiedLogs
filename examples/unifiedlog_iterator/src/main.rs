@@ -7,7 +7,9 @@
 
 use chrono::{SecondsFormat, TimeZone, Utc};
 use log::{LevelFilter, debug, error, info};
-use macos_unifiedlogs::filesystem::{LiveSystemProvider, LogarchiveProvider};
+use macos_unifiedlogs::filesystem::{
+    LiveSystemProvider, LogarchiveProvider, SharedLogarchiveProvider,
+};
 use macos_unifiedlogs::iterator::UnifiedLogIterator;
 use macos_unifiedlogs::parser::{build_log, collect_timesync, parse_log};
 use macos_unifiedlogs::timesync::TimesyncBoot;
@@ -21,6 +23,8 @@ use std::fmt::Display;
 use std::fs;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::sync_channel;
+use std::thread;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum, builder};
@@ -194,8 +198,10 @@ fn main() {
             .expect("Failed to configure thread pool");
     }
 
-    // Use BufWriter for better I/O performance (64KB buffer)
-    let handle: Box<dyn Write> = if let Some(path) = args.output {
+    // Use BufWriter for better I/O performance (64KB buffer).
+    // `+ Send` is required so the streaming writer thread in
+    // parse_trace_file_parallel can take ownership via thread::scope.
+    let handle: Box<dyn Write + Send> = if let Some(path) = args.output {
         Box::new(BufWriter::with_capacity(
             64 * 1024,
             fs::OpenOptions::new()
@@ -423,7 +429,24 @@ fn parse_trace_file(
     info!("Parsed {log_count} log entries");
 }
 
-// Parallel version of parse_trace_file
+// Parallel version of parse_trace_file.
+//
+// Memory-conscious design (was OOM-killing the deep_forensic container at
+// MemoryMax=2G with the previous implementation):
+//
+//   1. DSC strings cache (~500 MB) is preloaded ONCE into a SharedLogarchiveProvider
+//      whose `dsc_cache: Arc<HashMap>` is shared across worker threads via cheap
+//      Arc::clone. Previously each rayon task did `LogarchiveProvider::clone()`,
+//      deep-copying the entire HashMap and inflating peak RSS to ~3-4x DSC size.
+//
+//   2. Parsed LogData batches stream through a bounded `sync_channel(8)` to a
+//      dedicated writer thread instead of `par_iter().map(...).collect()`-ing
+//      every Vec<LogData> into RAM and only then writing. The writer borrows
+//      `&mut OutputWriter` via `thread::scope`, so no extra ownership shuffle
+//      is needed.
+//
+//   3. Phase 5 (oversize-string fixup) still merges per-file leftovers, but
+//      those payloads are tiny relative to the parsed log stream.
 fn parse_trace_file_parallel(
     archive_path: &Path,
     timesync_data: &HashMap<String, TimesyncBoot>,
@@ -431,17 +454,19 @@ fn parse_trace_file_parallel(
     max_files: Option<usize>,
 ) {
     let total_start = Instant::now();
-    
-    // Phase 1: Pre-load DSC files (shared cache strings)
-    // These are large (30-150MB each) but few (~5-6 files)
+
+    // Phase 1: Pre-load all DSC files into the shared, immutable cache.
     eprintln!("[PARALLEL] Pre-loading DSC files...");
     let preload_start = Instant::now();
-    let mut base_provider = LogarchiveProvider::new(archive_path);
-    base_provider.preload_dsc();
+    let base_provider = SharedLogarchiveProvider::with_preloaded_dsc(archive_path);
     let (_, dsc_count) = base_provider.cache_stats();
-    eprintln!("[PARALLEL] Pre-loaded {} DSC files in {:.2}s", dsc_count, preload_start.elapsed().as_secs_f64());
-    
-    // Phase 2: Collect all file paths
+    eprintln!(
+        "[PARALLEL] Pre-loaded {} DSC files in {:.2}s",
+        dsc_count,
+        preload_start.elapsed().as_secs_f64()
+    );
+
+    // Phase 2: Collect tracev3 file paths.
     let file_paths: Vec<String> = base_provider
         .tracev3_files()
         .filter(|source| {
@@ -452,136 +477,185 @@ fn parse_trace_file_parallel(
         .map(|source| source.source_path().to_string())
         .take(max_files.unwrap_or(usize::MAX))
         .collect();
-    
+
     let file_count = file_paths.len();
-    eprintln!("[PARALLEL] Processing {} files with {} threads", file_count, rayon::current_num_threads());
-    
-    // Phase 3: Process files in parallel
-    // Each thread gets a clone of the provider with pre-loaded DSC cache
-    let results: Vec<_> = file_paths
-        .par_iter()
-        .enumerate()
-        .map(|(idx, file_path)| {
-            let file_start = Instant::now();
-            
-            // Clone provider with pre-loaded DSC cache
-            let mut thread_provider = base_provider.clone();
-            
-            // Read file
-            let mut buf = Vec::new();
-            match fs::File::open(file_path) {
-                Ok(mut file) => {
-                    if let Err(err) = file.read_to_end(&mut buf) {
-                        log::error!("Failed to read {}: {}", file_path, err);
-                        let empty_oversize = UnifiedLogData {
+    eprintln!(
+        "[PARALLEL] Processing {} files with {} threads",
+        file_count,
+        rayon::current_num_threads()
+    );
+
+    // Bounded channel: caps in-flight parsed batches. Each slot holds one
+    // file-chunk's Vec<LogData> (typically a few hundred to a few thousand
+    // entries). 8 slots * threads keeps peak RAM bounded but still hides
+    // disk-write latency from the parser threads.
+    let (tx_logs, rx_logs) = sync_channel::<Vec<LogData>>(8);
+
+    // Phases 3 + 4 inside thread::scope so the writer thread can borrow
+    // &mut writer without 'static. Reborrow as a shorter-lived &mut so the
+    // original `writer` is usable again after the scope ends (for phase 5).
+    let writer_for_scope: &mut OutputWriter = &mut *writer;
+    let (all_oversize, all_missing, mut total_log_count) = thread::scope(|scope| {
+        // Writer thread: drains the channel one batch at a time, writes
+        // serially. Closing `tx_logs` is what makes this loop terminate.
+        // `move` is required because mpsc::Receiver is not Sync.
+        let writer_thread = scope.spawn(move || {
+            let mut written = 0usize;
+            while let Ok(batch) = rx_logs.recv() {
+                for record in &batch {
+                    if let Err(e) = writer_for_scope.write_record(record) {
+                        log::error!("Failed to write record: {e:?}");
+                    }
+                    written += 1;
+                }
+            }
+            if let Err(e) = writer_for_scope.flush() {
+                log::error!("Failed to flush writer: {e:?}");
+            }
+            written
+        });
+
+        // Workers: parse each tracev3, stream results, return per-file meta
+        // (oversize cache + missing-string fixups) for phase 5.
+        let meta: Vec<(UnifiedLogData, Vec<UnifiedLogData>, usize)> = file_paths
+            .par_iter()
+            .enumerate()
+            .map_with(tx_logs.clone(), |tx, (idx, file_path)| {
+                let file_start = Instant::now();
+                // Cheap clone: Arc::clone for dsc_cache + fresh empty
+                // uuidtext_cache. No HashMap deep-copy.
+                let mut thread_provider = base_provider.clone();
+
+                let mut buf = Vec::new();
+                if let Err(err) =
+                    fs::File::open(file_path).and_then(|mut f| f.read_to_end(&mut buf))
+                {
+                    log::error!("Failed to read {file_path}: {err}");
+                    return (
+                        UnifiedLogData {
                             header: Vec::new(),
                             catalog_data: Vec::new(),
                             oversize: Vec::new(),
-                        };
-                        return (Vec::new(), empty_oversize, Vec::new(), 0usize);
+                        },
+                        Vec::new(),
+                        0usize,
+                    );
+                }
+
+                let log_iterator = UnifiedLogIterator {
+                    data: buf,
+                    header: Vec::new(),
+                };
+
+                let mut local_oversize = UnifiedLogData {
+                    header: Vec::new(),
+                    catalog_data: Vec::new(),
+                    oversize: Vec::new(),
+                };
+                let mut local_missing: Vec<UnifiedLogData> = Vec::new();
+                let mut count = 0usize;
+                let exclude_missing = true;
+
+                for mut chunk in log_iterator {
+                    // Carry oversize-string state forward across chunks of
+                    // the same file (mirrors iterate_chunks).
+                    chunk.oversize.append(&mut local_oversize.oversize);
+                    let (results, missing_logs) =
+                        build_log(&chunk, &mut thread_provider, timesync_data, exclude_missing);
+                    count += results.len();
+                    local_oversize.oversize = chunk.oversize;
+
+                    if !results.is_empty() {
+                        // Backpressure: blocks if the writer thread is
+                        // behind. This is the core of the OOM fix.
+                        if tx.send(results).is_err() {
+                            log::error!("Writer thread closed early; dropping batch");
+                            break;
+                        }
+                    }
+
+                    if !missing_logs.catalog_data.is_empty()
+                        || !missing_logs.header.is_empty()
+                        || !missing_logs.oversize.is_empty()
+                    {
+                        local_missing.push(missing_logs);
                     }
                 }
-                Err(err) => {
-                    log::error!("Failed to open {}: {}", file_path, err);
-                    let empty_oversize = UnifiedLogData {
-                        header: Vec::new(),
-                        catalog_data: Vec::new(),
-                        oversize: Vec::new(),
-                    };
-                    return (Vec::new(), empty_oversize, Vec::new(), 0usize);
-                }
-            }
-            
-            let log_iterator = UnifiedLogIterator {
-                data: buf,
-                header: Vec::new(),
-            };
-            
-            let mut local_results: Vec<LogData> = Vec::new();
-            let mut local_oversize = UnifiedLogData {
-                header: Vec::new(),
-                catalog_data: Vec::new(),
-                oversize: Vec::new(),
-            };
-            let mut local_missing: Vec<UnifiedLogData> = Vec::new();
-            let exclude_missing = true;
-            
-            for mut chunk in log_iterator {
-                chunk.oversize.append(&mut local_oversize.oversize);
-                let (results, missing_logs) = build_log(&chunk, &mut thread_provider, timesync_data, exclude_missing);
-                local_results.extend(results);
-                local_oversize.oversize = chunk.oversize;
-                
-                if !missing_logs.catalog_data.is_empty()
-                    || !missing_logs.header.is_empty()
-                    || !missing_logs.oversize.is_empty()
-                {
-                    local_missing.push(missing_logs);
-                }
-            }
-            
-            let file_duration = file_start.elapsed();
-            let count = local_results.len();
-            eprintln!(
-                "[{}/{}] {} - {} entries ({:.0}/sec) in {:.2}s",
-                idx + 1,
-                file_count,
-                Path::new(file_path).file_name().unwrap().to_str().unwrap(),
-                count,
-                count as f64 / file_duration.as_secs_f64(),
-                file_duration.as_secs_f64()
-            );
-            
-            (local_results, local_oversize, local_missing, count)
-        })
-        .collect();
-    
-    // Phase 4: Merge and output results
-    let mut total_log_count = 0usize;
-    let mut all_oversize = UnifiedLogData {
-        header: Vec::new(),
-        catalog_data: Vec::new(),
-        oversize: Vec::new(),
-    };
-    let mut all_missing: Vec<UnifiedLogData> = Vec::new();
-    
-    for (logs, mut oversize_data, missing, count) in results {
-        total_log_count += count;
-        all_oversize.oversize.append(&mut oversize_data.oversize);
-        all_missing.extend(missing);
-        
-        // Output logs
-        if let Err(err) = output(&logs, writer) {
-            log::error!("Failed to output log data: {err:?}");
+
+                let file_duration = file_start.elapsed();
+                eprintln!(
+                    "[{}/{}] {} - {} entries ({:.0}/sec) in {:.2}s",
+                    idx + 1,
+                    file_count,
+                    Path::new(file_path).file_name().unwrap().to_str().unwrap(),
+                    count,
+                    count as f64 / file_duration.as_secs_f64().max(0.0001),
+                    file_duration.as_secs_f64()
+                );
+
+                (local_oversize, local_missing, count)
+            })
+            .collect();
+
+        // Drop the original tx so the writer thread sees EOF once all
+        // map_with clones have also been dropped (at this point they have,
+        // because collect() has joined all workers).
+        drop(tx_logs);
+        let written = writer_thread.join().expect("writer thread panicked");
+        eprintln!("[PARALLEL] Writer drained {written} records");
+
+        let mut all_oversize = UnifiedLogData {
+            header: Vec::new(),
+            catalog_data: Vec::new(),
+            oversize: Vec::new(),
+        };
+        let mut all_missing: Vec<UnifiedLogData> = Vec::new();
+        let mut total_log_count = 0usize;
+        for (mut local_oversize, local_missing, count) in meta {
+            total_log_count += count;
+            all_oversize.oversize.append(&mut local_oversize.oversize);
+            all_missing.extend(local_missing);
         }
-    }
-    
+        (all_oversize, all_missing, total_log_count)
+    });
+
     let total_duration = total_start.elapsed();
-    eprintln!("\n[BENCHMARK] Total parsing time: {:.2}s", total_duration.as_secs_f64());
-    eprintln!("[BENCHMARK] Files processed: {}", file_count);
-    eprintln!("[BENCHMARK] Total log entries: {}", total_log_count);
-    eprintln!("[BENCHMARK] Average: {:.0} entries/sec", total_log_count as f64 / total_duration.as_secs_f64());
-    
-    // Phase 5: Process missing data with merged oversize cache
+    eprintln!(
+        "\n[BENCHMARK] Total parsing time: {:.2}s",
+        total_duration.as_secs_f64()
+    );
+    eprintln!("[BENCHMARK] Files processed: {file_count}");
+    eprintln!("[BENCHMARK] Total log entries: {total_log_count}");
+    eprintln!(
+        "[BENCHMARK] Average: {:.0} entries/sec",
+        total_log_count as f64 / total_duration.as_secs_f64().max(0.0001)
+    );
+
     debug!("Oversize cache size: {}", all_oversize.oversize.len());
     debug!("Logs with missing Oversize strings: {}", all_missing.len());
-    
+
+    // Phase 5: re-process logs that referenced an oversize string located in
+    // a different tracev3. Sequential and small.
     if !all_missing.is_empty() {
-        eprintln!("[PARALLEL] Processing {} missing data entries...", all_missing.len());
+        eprintln!(
+            "[PARALLEL] Processing {} missing data entries...",
+            all_missing.len()
+        );
         let mut provider = LogarchiveProvider::new(archive_path);
         let include_missing = false;
-        
+
         for mut leftover_data in all_missing {
             leftover_data.oversize = all_oversize.oversize.clone();
-            let (results, _) = build_log(&leftover_data, &mut provider, timesync_data, include_missing);
+            let (results, _) =
+                build_log(&leftover_data, &mut provider, timesync_data, include_missing);
             total_log_count += results.len();
-            
+
             if let Err(err) = output(&results, writer) {
                 log::error!("Failed to output remaining log data: {err:?}");
             }
         }
     }
-    
+
     info!("Parsed {total_log_count} log entries");
 }
 
@@ -639,13 +713,13 @@ pub struct OutputWriter {
 }
 
 enum OutputWriterEnum {
-    Csv(Box<Writer<Box<dyn Write>>>),
-    Json(Box<dyn Write>),
+    Csv(Box<Writer<Box<dyn Write + Send>>>),
+    Json(Box<dyn Write + Send>),
 }
 
 impl OutputWriter {
     pub fn new(
-        writer: Box<dyn Write>,
+        writer: Box<dyn Write + Send>,
         file_format: &str,
         exclude_fields: HashSet<String>,
         exclude_processes: HashSet<String>,
@@ -782,7 +856,7 @@ fn output(results: &Vec<LogData>, writer: &mut OutputWriter) -> Result<(), Box<d
 /// Write record in Event format for optimized downstream processing
 /// Uses struct-based serialization with simd-json for maximum performance
 fn write_event_format(
-    json_writer: &mut Box<dyn Write>,
+    json_writer: &mut Box<dyn Write + Send>,
     record: &LogData,
     _exclude_fields: &HashSet<String>,
 ) -> Result<(), Box<dyn Error>> {

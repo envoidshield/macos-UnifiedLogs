@@ -1,12 +1,12 @@
 use crate::dsc::SharedCacheStrings;
 use crate::traits::{FileProvider, SourceFile};
 use crate::uuidtext::UUIDText;
-use log::error;
+use log::{error, warn};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use walkdir::WalkDir;
 
 pub struct LocalFile {
@@ -560,57 +560,62 @@ impl FileProvider for LogarchiveProvider {
     }
 }
 
-/// Thread-safe shared caches for parallel processing
-#[derive(Clone)]
-pub struct SharedProviderCaches {
-    uuidtext_cache: Arc<RwLock<HashMap<String, UUIDText>>>,
-    dsc_cache: Arc<RwLock<HashMap<String, SharedCacheStrings>>>,
-}
-
-impl SharedProviderCaches {
-    /// Create new shared caches
-    pub fn new() -> Self {
-        Self {
-            uuidtext_cache: Arc::new(RwLock::new(HashMap::new())),
-            dsc_cache: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-impl Default for SharedProviderCaches {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Thread-safe version of LogarchiveProvider with shared caches for parallel processing.
-/// All clones share the same underlying caches, reducing memory usage in multi-threaded scenarios.
+/// Thread-safe LogarchiveProvider for parallel processing.
+///
+/// DSC files are large (30-150MB each, ~5-6 of them) and identical for every
+/// thread. They are preloaded once into an `Arc<HashMap>` and shared across
+/// all clones via cheap `Arc::clone`. The DSC cache is immutable after
+/// construction; `update_dsc` is a no-op.
+///
+/// UUIDText files are small and accessed unpredictably by each tracev3 file,
+/// so each clone owns its own per-thread cache (lazy-loaded, bounded LRU).
+///
+/// Usage (per-thread fork is just `.clone()`):
+/// ```ignore
+///   let base = SharedLogarchiveProvider::with_preloaded_dsc(path);
+///   file_paths.par_iter().for_each(|p| {
+///       let mut local = base.clone();
+///       // ... use &mut local with build_log ...
+///   });
+/// ```
 #[derive(Clone)]
 pub struct SharedLogarchiveProvider {
     base: PathBuf,
-    caches: SharedProviderCaches,
+    /// Preloaded DSC cache shared across all clones. Read-only after construction.
+    /// `Arc<HashMap>` derefs to `&HashMap`, which lets `cached_dsc()` return a
+    /// real `&SharedCacheStrings` (unlike a `RwLock` whose guard's lifetime
+    /// can't escape the lookup).
+    dsc_cache: Arc<HashMap<String, SharedCacheStrings>>,
+    /// Per-instance UUIDText cache, lazy-loaded. Each cloned provider gets its
+    /// own (initially empty) cache; threads do not contend on this.
+    uuidtext_cache: HashMap<String, UUIDText>,
 }
 
 impl SharedLogarchiveProvider {
-    /// Create a new SharedLogarchiveProvider with empty caches
+    /// Create a new SharedLogarchiveProvider with empty caches.
     pub fn new(path: &Path) -> Self {
         Self {
             base: path.to_path_buf(),
-            caches: SharedProviderCaches::new(),
+            dsc_cache: Arc::new(HashMap::new()),
+            uuidtext_cache: HashMap::new(),
         }
     }
 
-    /// Create a new SharedLogarchiveProvider with pre-existing shared caches
-    pub fn with_caches(path: &Path, caches: SharedProviderCaches) -> Self {
+    /// Create a new SharedLogarchiveProvider with all DSC files preloaded.
+    /// Call this once on the main thread; clone the result per worker.
+    pub fn with_preloaded_dsc(path: &Path) -> Self {
+        let mut tmp = LogarchiveProvider::new(path);
+        tmp.preload_dsc();
         Self {
             base: path.to_path_buf(),
-            caches,
+            dsc_cache: Arc::new(tmp.dsc_cache),
+            uuidtext_cache: HashMap::new(),
         }
     }
 
-    /// Get the shared caches (can be passed to other providers)
-    pub fn caches(&self) -> SharedProviderCaches {
-        self.caches.clone()
+    /// Number of (uuidtext, dsc) entries currently cached.
+    pub fn cache_stats(&self) -> (usize, usize) {
+        (self.uuidtext_cache.len(), self.dsc_cache.len())
     }
 
     fn read_uuidtext_internal(&self, uuid: &str) -> Result<UUIDText, Error> {
@@ -655,46 +660,6 @@ impl SharedLogarchiveProvider {
 
         Ok(uuid_text)
     }
-
-    fn read_dsc_internal(&self, uuid: &str) -> Result<SharedCacheStrings, Error> {
-        let uuid_len = 32;
-        let uuid = if uuid.len() == uuid_len - 1 {
-            format!("0{uuid}")
-        } else if uuid.len() == uuid_len - 2 {
-            format!("00{uuid}")
-        } else if uuid.len() == uuid_len {
-            uuid.to_string()
-        } else {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                format!("uuid length not correct: {uuid}"),
-            ));
-        };
-
-        let mut base = self.base.clone();
-        base.push("dsc");
-        base.push(&uuid);
-
-        let mut buf = Vec::new();
-        let mut file = LocalFile::new(&base)?;
-        file.reader().read_to_end(&mut buf)?;
-
-        let dsc = match SharedCacheStrings::parse_dsc(&buf) {
-            Ok((_, results)) => results,
-            Err(err) => {
-                error!(
-                    "[macos-unifiedlogs] Failed to parse dsc UUID file {}: {err:?}",
-                    base.to_str().unwrap_or_default(),
-                );
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    format!("failed to read: {uuid}"),
-                ));
-            }
-        };
-
-        Ok(dsc)
-    }
 }
 
 impl FileProvider for SharedLogarchiveProvider {
@@ -727,47 +692,31 @@ impl FileProvider for SharedLogarchiveProvider {
         self.read_uuidtext_internal(uuid)
     }
 
-    fn cached_uuidtext(&self, _uuid: &str) -> Option<&UUIDText> {
-        // Returns None for SharedLogarchiveProvider - use cached_uuidtext_owned() instead
-        None
-    }
-
-    fn cached_uuidtext_owned(&self, uuid: &str) -> Option<UUIDText> {
-        let cache = self.caches.uuidtext_cache.read().unwrap();
-        cache.get(uuid).cloned()
+    fn cached_uuidtext(&self, uuid: &str) -> Option<&UUIDText> {
+        self.uuidtext_cache.get(uuid)
     }
 
     fn update_uuid(&mut self, uuid: &str, uuid2: &str) {
-        // First check if already in cache
-        {
-            let cache = self.caches.uuidtext_cache.read().unwrap();
-            if cache.contains_key(uuid) {
-                return;
-            }
-        }
-
-        // Read the file
         let status = match self.read_uuidtext_internal(uuid) {
             Ok(result) => result,
             Err(_err) => return,
         };
-
-        // Insert into cache with write lock
-        let mut cache = self.caches.uuidtext_cache.write().unwrap();
-        
-        // Keep cache size bounded
-        if cache.len() > 50 {
-            let keys_to_remove: Vec<String> = cache
+        // Bound the per-thread UUIDText cache the same way LogarchiveProvider does.
+        if self.uuidtext_cache.len() > 30 {
+            for key in self
+                .uuidtext_cache
                 .keys()
-                .filter(|k| *k != uuid && *k != uuid2)
-                .take(10)
+                .take(5)
                 .cloned()
-                .collect();
-            for key in keys_to_remove {
-                cache.remove(&key);
+                .collect::<Vec<String>>()
+            {
+                if key == uuid || key == uuid2 {
+                    continue;
+                }
+                self.uuidtext_cache.remove(&key);
             }
         }
-        cache.insert(uuid.to_string(), status);
+        self.uuidtext_cache.insert(uuid.to_string(), status);
     }
 
     fn dsc_files(&self) -> Box<dyn Iterator<Item = Box<dyn SourceFile>>> {
@@ -783,46 +732,63 @@ impl FileProvider for SharedLogarchiveProvider {
     }
 
     fn read_dsc_uuid(&self, uuid: &str) -> Result<SharedCacheStrings, Error> {
-        self.read_dsc_internal(uuid)
-    }
-
-    fn cached_dsc(&self, _uuid: &str) -> Option<&SharedCacheStrings> {
-        // Returns None for SharedLogarchiveProvider - use cached_dsc_owned() instead
-        None
-    }
-
-    fn cached_dsc_owned(&self, uuid: &str) -> Option<SharedCacheStrings> {
-        let cache = self.caches.dsc_cache.read().unwrap();
-        cache.get(uuid).cloned()
-    }
-
-    fn update_dsc(&mut self, uuid: &str, uuid2: &str) {
-        // First check if already in cache
-        {
-            let cache = self.caches.dsc_cache.read().unwrap();
-            if cache.contains_key(uuid) {
-                return;
-            }
-        }
-
-        // Read the file
-        let status = match self.read_dsc_internal(uuid) {
-            Ok(result) => result,
-            Err(_err) => return,
+        // Mirrors LogarchiveProvider::read_dsc_uuid for callers that bypass the cache.
+        let uuid_len = 32;
+        let uuid = if uuid.len() == uuid_len - 1 {
+            &format!("0{uuid}")
+        } else if uuid.len() == uuid_len - 2 {
+            &format!("00{uuid}")
+        } else if uuid.len() == uuid_len {
+            uuid
+        } else {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("uuid length not correct: {uuid}"),
+            ));
         };
 
-        // Insert into cache with write lock
-        let mut cache = self.caches.dsc_cache.write().unwrap();
-        
-        // Keep cache size bounded (DSC files are large, 30-150MB)
-        while cache.len() > 4 {
-            if let Some(key) = cache.keys().find(|k| *k != uuid && *k != uuid2).cloned() {
-                cache.remove(&key);
-            } else {
-                break;
+        let mut base = self.base.clone();
+        base.push("dsc");
+        base.push(uuid);
+
+        let mut buf = Vec::new();
+        let mut file = LocalFile::new(&base)?;
+        file.reader().read_to_end(&mut buf)?;
+
+        match SharedCacheStrings::parse_dsc(&buf) {
+            Ok((_, results)) => Ok(results),
+            Err(err) => {
+                error!(
+                    "[macos-unifiedlogs] Failed to parse dsc UUID file {}: {err:?}",
+                    base.to_str().unwrap_or_default(),
+                );
+                Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("failed to read: {uuid}"),
+                ))
             }
         }
-        cache.insert(uuid.to_string(), status);
+    }
+
+    fn cached_dsc(&self, uuid: &str) -> Option<&SharedCacheStrings> {
+        // Arc<HashMap> auto-derefs to &HashMap; the returned reference's
+        // lifetime is tied to &self, which is sufficient for the call sites
+        // in chunks/firehose/message.rs that hold the borrow briefly.
+        self.dsc_cache.get(uuid)
+    }
+
+    fn update_dsc(&mut self, uuid: &str, _uuid2: &str) {
+        // No-op: DSC cache is preloaded and immutable for the lifetime of the
+        // provider. If a tracev3 references a DSC UUID we somehow didn't see
+        // during preload (race with logd rolling, manually edited archive,
+        // etc.) the lookup just misses and the entry renders as "Unknown
+        // shared string message" - same behavior as a missing DSC file.
+        if !self.dsc_cache.contains_key(uuid) {
+            warn!(
+                "[macos-unifiedlogs] DSC {uuid} not in preloaded cache; \
+                 update_dsc is a no-op for SharedLogarchiveProvider"
+            );
+        }
     }
 
     fn timesync_files(&self) -> Box<dyn Iterator<Item = Box<dyn SourceFile>>> {
@@ -835,16 +801,6 @@ impl FileProvider for SharedLogarchiveProvider {
                     Some(Box::new(LocalFile::new(entry.path()).ok()?) as Box<dyn SourceFile>)
                 }),
         )
-    }
-}
-
-/// Extension methods for SharedLogarchiveProvider
-impl SharedLogarchiveProvider {
-    /// Get current cache sizes
-    pub fn cache_stats(&self) -> (usize, usize) {
-        let uuidtext_size = self.caches.uuidtext_cache.read().unwrap().len();
-        let dsc_size = self.caches.dsc_cache.read().unwrap().len();
-        (uuidtext_size, dsc_size)
     }
 }
 
