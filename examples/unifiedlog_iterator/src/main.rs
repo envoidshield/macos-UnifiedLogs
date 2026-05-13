@@ -118,6 +118,18 @@ struct Args {
     /// Number of threads for parallel processing (default: all cores)
     #[clap(long, short = 't')]
     threads: Option<usize>,
+
+    /// Comma-separated list of full process paths to skip emission for.
+    /// Filtering happens before serialization, so dropped entries pay no
+    /// JSON/CSV cost. Repeat or comma-join to add multiple paths.
+    #[clap(long, value_delimiter = ',')]
+    exclude_processes: Option<Vec<String>>,
+
+    /// File with newline-separated full process paths to skip emission for.
+    /// Lines starting with '#' and blank lines are ignored.
+    /// Merged with --exclude-processes if both are given.
+    #[clap(long)]
+    exclude_processes_file: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
@@ -202,8 +214,41 @@ fn main() {
         .into_iter()
         .collect();
 
+    let mut exclude_processes: HashSet<String> = args
+        .exclude_processes
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .collect();
+    if let Some(path) = args.exclude_processes_file {
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                for line in contents.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        exclude_processes.insert(trimmed.to_string());
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read --exclude-processes-file {path:?}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if !exclude_processes.is_empty() {
+        info!("Filtering {} process path(s) before output", exclude_processes.len());
+    }
+
     let json_output_format = args.output_format;
-    let mut writer = OutputWriter::new(handle, output_format.into(), exclude_fields, json_output_format).unwrap();
+    let mut writer = OutputWriter::new(
+        handle,
+        output_format.into(),
+        exclude_fields,
+        exclude_processes,
+        json_output_format,
+    )
+    .unwrap();
 
     match (args.mode, args.input) {
         (Mode::Live, None) => {
@@ -589,6 +634,7 @@ fn iterate_chunks(
 pub struct OutputWriter {
     writer: OutputWriterEnum,
     exclude_fields: HashSet<String>,
+    exclude_processes: HashSet<String>,
     output_format: OutputFormat,
 }
 
@@ -602,6 +648,7 @@ impl OutputWriter {
         writer: Box<dyn Write>,
         file_format: &str,
         exclude_fields: HashSet<String>,
+        exclude_processes: HashSet<String>,
         output_format: OutputFormat,
     ) -> Result<Self, Box<dyn Error>> {
         let writer_enum = match file_format {
@@ -640,11 +687,20 @@ impl OutputWriter {
         Ok(OutputWriter {
             writer: writer_enum,
             exclude_fields,
+            exclude_processes,
             output_format,
         })
     }
 
     pub fn write_record(&mut self, record: &LogData) -> Result<(), Box<dyn Error>> {
+        // Drop entries from known-noise processes before paying serialization cost.
+        // Filter is exact-path; basename-only matches would risk false positives
+        // on user binaries that happen to share a daemon name.
+        if !self.exclude_processes.is_empty()
+            && self.exclude_processes.contains(record.process.as_str())
+        {
+            return Ok(());
+        }
         match &mut self.writer {
             OutputWriterEnum::Csv(csv_writer) => {
                 let date_time = Utc.timestamp_nanos(record.time as i64);
