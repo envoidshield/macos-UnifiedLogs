@@ -50,11 +50,13 @@ struct EventData<'a> {
     pid: u64,
     euid: u32,
     library: &'a str,
+    library_uuid: &'a str,
     time: f64,
     category: &'a str,
     event_type: String,
     log_type: String,
     process: &'a str,
+    process_uuid: &'a str,
 }
 
 #[derive(Clone, Debug)]
@@ -858,7 +860,7 @@ fn output(results: &Vec<LogData>, writer: &mut OutputWriter) -> Result<(), Box<d
 fn write_event_format(
     json_writer: &mut Box<dyn Write + Send>,
     record: &LogData,
-    _exclude_fields: &HashSet<String>,
+    exclude_fields: &HashSet<String>,
 ) -> Result<(), Box<dyn Error>> {
     // Convert time from nanoseconds to datetime and timestamp
     let time_nanos = record.time as i64;
@@ -873,11 +875,21 @@ fn write_event_format(
         pid: record.pid,
         euid: record.euid,
         library: &record.library,
+        library_uuid: if exclude_fields.contains("library_uuid") {
+            ""
+        } else {
+            &record.library_uuid
+        },
         time: record.time,
         category: &record.category,
         event_type: format!("{:?}", record.event_type),
         log_type: format!("{:?}", record.log_type),
         process: &record.process,
+        process_uuid: if exclude_fields.contains("process_uuid") {
+            ""
+        } else {
+            &record.process_uuid
+        },
     };
 
     // Build the Event struct
