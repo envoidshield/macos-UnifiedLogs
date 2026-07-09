@@ -29,7 +29,7 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum, builder};
 use csv::Writer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Event format output structure for optimized downstream processing
 #[derive(Serialize)]
@@ -125,17 +125,17 @@ struct Args {
     #[clap(long, short = 't')]
     threads: Option<usize>,
 
-    /// Comma-separated list of full process paths to skip emission for.
-    /// Filtering happens before serialization, so dropped entries pay no
-    /// JSON/CSV cost. Repeat or comma-join to add multiple paths.
-    #[clap(long, value_delimiter = ',')]
-    exclude_processes: Option<Vec<String>>,
-
-    /// File with newline-separated full process paths to skip emission for.
-    /// Lines starting with '#' and blank lines are ignored.
-    /// Merged with --exclude-processes if both are given.
+    /// JSONL file with keep rules. Each line is {"process":"..."} and/or
+    /// {"contains":"..."}. Keep line if any rule matches (OR). Filtering
+    /// happens before serialization.
     #[clap(long)]
-    exclude_processes_file: Option<PathBuf>,
+    keep_rules_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct KeepRule {
+    process: Option<String>,
+    contains: Option<String>,
 }
 
 #[derive(Parser, Debug, Clone, ValueEnum)]
@@ -222,30 +222,12 @@ fn main() {
         .into_iter()
         .collect();
 
-    let mut exclude_processes: HashSet<String> = args
-        .exclude_processes
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|p| !p.is_empty())
-        .collect();
-    if let Some(path) = args.exclude_processes_file {
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                for line in contents.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                        exclude_processes.insert(trimmed.to_string());
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to read --exclude-processes-file {path:?}: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    if !exclude_processes.is_empty() {
-        info!("Filtering {} process path(s) before output", exclude_processes.len());
+    let keep_rules = match args.keep_rules_file {
+        Some(path) => load_keep_rules(&path),
+        None => Vec::new(),
+    };
+    if !keep_rules.is_empty() {
+        info!("Loaded {} keep rule(s) before output", keep_rules.len());
     }
 
     let json_output_format = args.output_format;
@@ -253,7 +235,7 @@ fn main() {
         handle,
         output_format.into(),
         exclude_fields,
-        exclude_processes,
+        keep_rules,
         json_output_format,
     )
     .unwrap();
@@ -710,7 +692,7 @@ fn iterate_chunks(
 pub struct OutputWriter {
     writer: OutputWriterEnum,
     exclude_fields: HashSet<String>,
-    exclude_processes: HashSet<String>,
+    keep_rules: Vec<KeepRule>,
     output_format: OutputFormat,
 }
 
@@ -724,7 +706,7 @@ impl OutputWriter {
         writer: Box<dyn Write + Send>,
         file_format: &str,
         exclude_fields: HashSet<String>,
-        exclude_processes: HashSet<String>,
+        keep_rules: Vec<KeepRule>,
         output_format: OutputFormat,
     ) -> Result<Self, Box<dyn Error>> {
         let writer_enum = match file_format {
@@ -763,18 +745,13 @@ impl OutputWriter {
         Ok(OutputWriter {
             writer: writer_enum,
             exclude_fields,
-            exclude_processes,
+            keep_rules,
             output_format,
         })
     }
 
     pub fn write_record(&mut self, record: &LogData) -> Result<(), Box<dyn Error>> {
-        // Drop entries from known-noise processes before paying serialization cost.
-        // Filter is exact-path; basename-only matches would risk false positives
-        // on user binaries that happen to share a daemon name.
-        if !self.exclude_processes.is_empty()
-            && self.exclude_processes.contains(record.process.as_str())
-        {
+        if !self.keep_rules.is_empty() && !matches_keep_rules(record, &self.keep_rules) {
             return Ok(());
         }
         match &mut self.writer {
@@ -904,4 +881,57 @@ fn write_event_format(
 
     writeln!(json_writer, "{}", serde_json::to_string(&event)?)?;
     Ok(())
+}
+
+fn load_keep_rules(path: &Path) -> Vec<KeepRule> {
+    let contents = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to read --keep-rules-file {path:?}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut rules = Vec::new();
+    for (lineno, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<KeepRule>(trimmed) {
+            Ok(rule) => {
+                if rule.process.is_none() && rule.contains.is_none() {
+                    error!("keep-rules line {}: rule must have process and/or contains", lineno + 1);
+                    std::process::exit(1);
+                }
+                rules.push(rule);
+            }
+            Err(e) => {
+                error!("keep-rules line {}: invalid JSON: {e}", lineno + 1);
+                std::process::exit(1);
+            }
+        }
+    }
+    rules
+}
+
+fn matches_keep_rules(record: &LogData, rules: &[KeepRule]) -> bool {
+    rules.iter().any(|rule| rule_matches(record, rule))
+}
+
+fn rule_matches(record: &LogData, rule: &KeepRule) -> bool {
+    if let Some(ref frag) = rule.process {
+        if !record.process.contains(frag.as_str()) {
+            return false;
+        }
+    }
+    if let Some(ref needle) = rule.contains {
+        let hay = format!(
+            "{}\0{}\0{}",
+            record.message, record.subsystem, record.category
+        );
+        if !hay.contains(needle.as_str()) {
+            return false;
+        }
+    }
+    true
 }
