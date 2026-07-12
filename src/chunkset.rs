@@ -10,13 +10,14 @@ use std::mem::size_of;
 use log::{error, warn};
 use lz4_flex::decompress;
 use nom::{
-    Needed,
     bytes::complete::{take, take_while},
     number::complete::{le_u32, le_u64},
+    Needed,
 };
 
 use crate::chunks::simpledump::SimpleDump;
 use crate::chunks::statedump::Statedump;
+use crate::lzbitmap;
 use crate::{chunks::firehose::firehose_log::FirehosePreamble, util::u64_to_usize};
 use crate::{
     chunks::oversize::Oversize, preamble::LogPreamble, unified_log::UnifiedLogCatalogData,
@@ -42,12 +43,53 @@ impl ChunksetChunk {
         let (input, chunk_tag) = take(size_of::<u32>())(data)?;
         let (input, chunk_sub_tag) = take(size_of::<u32>())(input)?;
         let (input, chunk_data_size) = take(size_of::<u64>())(input)?;
+        let body_input = input;
         let (input, signature) = take(size_of::<u32>())(input)?;
         let (input, uncompress_size) = take(size_of::<u32>())(input)?;
 
         let (_, chunkset_chunk_tag) = le_u32(chunk_tag)?;
         let (_, chunkset_chunk_sub_tag) = le_u32(chunk_sub_tag)?;
         let (_, chunkset_chunk_data_size) = le_u64(chunk_data_size)?;
+
+        let body_size = u64_to_usize(chunkset_chunk_data_size).ok_or_else(|| {
+            nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TooLarge,
+            ))
+        })?;
+        let (remaining, body) = take(body_size)(body_input)?;
+        if body.starts_with(b"ZBM\x09") {
+            let decompressed_data = lzbitmap::decompress(body).map_err(|err| {
+                error!("[macos-unifiedlogs] Failed to decompress LZBITMAP log data: {err}");
+                nom::Err::Error(nom::error::Error::new(body, nom::error::ErrorKind::Verify))
+            })?;
+            let uncompress_size = u32::try_from(decompressed_data.len()).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    body,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            let block_size = u32::try_from(body.len()).map_err(|_| {
+                nom::Err::Error(nom::error::Error::new(
+                    body,
+                    nom::error::ErrorKind::TooLarge,
+                ))
+            })?;
+            return Ok((
+                remaining,
+                ChunksetChunk {
+                    chunk_tag: chunkset_chunk_tag,
+                    chunk_sub_tag: chunkset_chunk_sub_tag,
+                    chunk_data_size: chunkset_chunk_data_size,
+                    signature: 0x094d_425a,
+                    uncompress_size,
+                    block_size,
+                    decompressed_data,
+                    footer: 0,
+                },
+            ));
+        }
+
         let (_, chunkset_sig) = le_u32(signature)?;
         let (_, chunkset_uncompress_size) = le_u32(uncompress_size)?;
 
@@ -64,10 +106,10 @@ impl ChunksetChunk {
             return Ok((input, chunkset_chunk));
         }
 
-        // Compressed data signatue should be bv41
+        // Compressed data signature should be bv41 or ZBM (handled above).
         if chunkset_sig != bv41 {
             error!(
-                "[macos-unifiedlogs] Incorrect compression signature expected bv41, got: {chunkset_sig:?}"
+                "[macos-unifiedlogs] Unsupported chunkset compression signature: {chunkset_sig} (0x{chunkset_sig:x})"
             );
             return Err(nom::Err::Incomplete(Needed::Unknown));
         }
@@ -2215,6 +2257,10 @@ mod tests {
                 number_process_information_entries: 0,
                 catalog_offset_sub_chunks: 0,
                 number_sub_chunks: 0,
+                catalog_additional_data_offset: 0,
+                number_additional_data_entries: 0,
+                catalog_flags: 0,
+                catalog_additional_data: Vec::new(),
                 unknown: Vec::new(),
                 earliest_firehose_timestamp: 0,
                 catalog_uuids: Vec::new(),
@@ -2262,6 +2308,10 @@ mod tests {
                 number_process_information_entries: 0,
                 catalog_offset_sub_chunks: 0,
                 number_sub_chunks: 0,
+                catalog_additional_data_offset: 0,
+                number_additional_data_entries: 0,
+                catalog_flags: 0,
+                catalog_additional_data: Vec::new(),
                 unknown: Vec::new(),
                 earliest_firehose_timestamp: 0,
                 catalog_uuids: Vec::new(),
