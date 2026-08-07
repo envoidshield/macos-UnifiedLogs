@@ -31,7 +31,7 @@ const STRING_TYPES: [&str; 6] = ["c", "s", "@", "S", "C", "P"];
 /// Format the Unified Log message entry based on the parsed log items. Formatting follows the C lang prinf formatting process
 pub fn format_firehose_log_message(
     format_string: String,
-    item_message: &Vec<FirehoseItemInfo>,
+    item_message: &[FirehoseItemInfo],
     message_re: &Regex,
 ) -> String {
     let mut log_message = format_string;

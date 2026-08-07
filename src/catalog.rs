@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use crate::{preamble::LogPreamble, util::*};
 use log::error;
 use nom::{
-    IResult, Parser,
     bytes::complete::take,
     combinator::map,
-    error::{ErrorKind, make_error},
+    error::{make_error, ErrorKind},
     multi::many_m_n,
     number::complete::{be_u128, le_u16, le_u32, le_u64},
+    IResult, Parser,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -31,7 +31,12 @@ pub struct CatalogChunk {
     /// offset relative to start of catalog UUIDs
     pub catalog_offset_sub_chunks: u16,
     pub number_sub_chunks: u16,
-    /// unknown 6 bytes, padding? alignment?
+    /// Catalog V2-only offset relative to the start of catalog UUIDs
+    pub catalog_additional_data_offset: u16,
+    pub number_additional_data_entries: u16,
+    pub catalog_flags: u16,
+    pub catalog_additional_data: Vec<u8>,
+    /// Raw little-endian representation of the three Catalog V2 fields
     pub unknown: Vec<u8>,
     pub earliest_firehose_timestamp: u64,
     /// array of UUIDs in big endian
@@ -95,7 +100,7 @@ pub struct CatalogSubchunk {
     pub start: u64,
     pub end: u64,
     pub uncompressed_size: u32,
-    /// Should always be LZ4 (value 0x100)
+    /// Compression algorithm identifier, such as LZ4 (0x100) or LZBITMAP1 (0x701)
     pub compression_algorithm: u32,
     pub number_index: u32,
     /// indexes size = `number_index` * u16
@@ -115,7 +120,9 @@ impl CatalogChunk {
     /// Parse log Catalog data. The log Catalog contains metadata related to log entries such as Process info, Subsystem info, and the compressed log entries
     pub fn parse_catalog(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, preamble) = LogPreamble::parse(input)?;
-        let mut tup = (le_u16, le_u16, le_u16, le_u16, le_u16);
+        let mut tup = (
+            le_u16, le_u16, le_u16, le_u16, le_u16, le_u16, le_u16, le_u16,
+        );
         let (
             input,
             (
@@ -124,12 +131,19 @@ impl CatalogChunk {
                 number_process_information_entries,
                 catalog_offset_sub_chunks,
                 number_sub_chunks,
+                catalog_additional_data_offset,
+                number_additional_data_entries,
+                catalog_flags,
             ),
         ) = tup.parse(input)?;
 
-        const UNKNOWN_LENGTH: u8 = 6;
-        let (input, unknown) = map(take(UNKNOWN_LENGTH), |v: &[u8]| v.to_vec()).parse(input)?;
         let (input, earliest_firehose_timestamp) = le_u64(input)?;
+        let unknown = [
+            catalog_additional_data_offset.to_le_bytes(),
+            number_additional_data_entries.to_le_bytes(),
+            catalog_flags.to_le_bytes(),
+        ]
+        .concat();
 
         const UUID_LENGTH: usize = 16;
         let number_catalog_uuids = catalog_subsystem_strings_offset as usize / UUID_LENGTH;
@@ -163,6 +177,21 @@ impl CatalogChunk {
                 entry,
             );
         }
+
+        let catalog_additional_data_length = if number_additional_data_entries != 0
+            && catalog_additional_data_offset >= catalog_process_info_entries_offset
+            && catalog_additional_data_offset <= catalog_offset_sub_chunks
+        {
+            catalog_offset_sub_chunks - catalog_additional_data_offset
+        } else {
+            0
+        };
+        let (input, catalog_additional_data) =
+            map(take(catalog_additional_data_length), |data: &[u8]| {
+                data.to_vec()
+            })
+            .parse(input)?;
+
         let (input, catalog_subchunks) = many_m_n(
             number_sub_chunks as usize,
             number_sub_chunks as usize,
@@ -180,6 +209,10 @@ impl CatalogChunk {
                 number_process_information_entries,
                 catalog_offset_sub_chunks,
                 number_sub_chunks,
+                catalog_additional_data_offset,
+                number_additional_data_entries,
+                catalog_flags,
+                catalog_additional_data,
                 unknown,
                 earliest_firehose_timestamp,
                 catalog_uuids,
@@ -330,11 +363,6 @@ impl CatalogChunk {
         let mut tup = (le_u64, le_u64, le_u32, le_u32, le_u32);
         let (input, (start, end, uncompressed_size, compression_algorithmn, number_index)) =
             tup.parse(input)?;
-
-        const LZ4_COMPRESSION: u32 = 256;
-        if compression_algorithmn != LZ4_COMPRESSION {
-            return Err(nom::Err::Error(make_error(input, ErrorKind::OneOf)));
-        }
 
         let (input, indexes) =
             many_m_n(number_index as _, number_index as _, le_u16).parse(input)?;
@@ -664,7 +692,8 @@ mod tests {
             68, 234, 2, 0, 119, 171, 170, 119, 76, 234, 2, 0, 240, 254, 0, 0, 0, 1, 0, 0, 1, 0, 0,
             0, 0, 0, 3, 0, 0, 0, 0, 0, 19, 0, 47, 0,
         ];
-        assert!(CatalogChunk::parse_catalog_subchunk(test_bad_compression).is_err());
+        let (_, subchunk) = CatalogChunk::parse_catalog_subchunk(test_bad_compression).unwrap();
+        assert_eq!(subchunk.compression_algorithm, 512);
     }
 
     #[test]
